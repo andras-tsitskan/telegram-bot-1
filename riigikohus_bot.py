@@ -156,8 +156,11 @@ def _tag_text(tag, names):
 
 
 def _extract_full_number(text: str) -> str:
-    """Extract judgment number e.g. 1-22-6710/83 or 1-24-1715."""
-    m = re.search(r"\b(1-\d{2}-\d+/\d+)\b", text)
+    """
+    Extract judgment number e.g. 1-22-6710/83 or 1-24-1715.
+    The /NN suffix is not a word character so we cannot use \b after it.
+    """
+    m = re.search(r"\b(1-\d{2}-\d+/\d+)(?=\s|$|[?&\"'<>])", text)
     if m:
         return m.group(1)
     m = re.search(r"\b(1-\d{2}-\d+)\b", text)
@@ -241,8 +244,20 @@ def fetch_annotation(case_number: str) -> str:
     return annotation
 
 
+# Keyword that must appear in the scraped text for it to be accepted as a
+# real annotation.  rikos.rik.ee annotations always contain this Estonian
+# word.  If the scraped block doesn't contain it we treat the result as
+# boilerplate / navigation noise and return nothing.
+_ANNOTATION_MARKER = re.compile(r"annotat", re.I)
+
+
 def _parse_annotation(soup: BeautifulSoup) -> str:
-    """Extract annotation body text from a rikos.rik.ee page."""
+    """
+    Extract annotation body from a rikos.rik.ee page, preserving bold
+    formatting as Telegram HTML <b> tags with blank lines around them.
+
+    Returns a string of Telegram-safe HTML, or '' if no annotation found.
+    """
     selectors = [
         lambda s: s.find("div", class_=re.compile(r"annotat", re.I)),
         lambda s: s.find("div", id=re.compile(r"annotat", re.I)),
@@ -260,20 +275,87 @@ def _parse_annotation(soup: BeautifulSoup) -> str:
             continue
         for tag in node.find_all(["script", "style", "nav", "header", "footer"]):
             tag.decompose()
-        text = node.get_text(separator="\n", strip=True)
-        if len(text) > 200:
-            return _normalise(text)
+        # Quick plain-text check first — must be substantial and annotation-like
+        plain = node.get_text(separator=" ", strip=True)
+        if len(plain) > 200 and _ANNOTATION_MARKER.search(plain):
+            return _node_to_telegram_html(node)
 
-    # Last resort: substantial <p> blocks
-    paragraphs = [
-        p.get_text(strip=True) for p in soup.find_all("p")
-        if len(p.get_text(strip=True)) > 60
-    ]
-    return _normalise("\n\n".join(paragraphs)) if paragraphs else ""
+    return ""
 
 
-def _normalise(text: str) -> str:
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+def _node_to_telegram_html(node) -> str:
+    """
+    Walk a BeautifulSoup node and convert it to Telegram-safe HTML.
+
+    Rules:
+    - <strong> and <b> content → <b>...</b> in output
+    - Block elements (p, div, br, li, h1-h6) → newlines
+    - Bold blocks get a blank line before and after them
+    - All plain text is HTML-escaped
+    - Consecutive blank lines are collapsed to one
+    """
+    parts = []
+    _walk(node, parts, in_bold=False)
+    text = "".join(parts)
+    # Collapse runs of 3+ newlines to 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _walk(node, parts: list, in_bold: bool) -> None:
+    """Recursively walk the BeautifulSoup tree, appending to parts."""
+    from bs4 import NavigableString, Tag
+
+    if isinstance(node, NavigableString):
+        content = str(node)
+        if content.strip():
+            parts.append(_esc(content) if not in_bold else _esc(content))
+        elif content and parts and not parts[-1].endswith("\n"):
+            # Preserve a single space for inline whitespace
+            parts.append(" ")
+        return
+
+    if not isinstance(node, Tag):
+        return
+
+    tag = node.name.lower() if node.name else ""
+
+    # Tags to skip entirely
+    if tag in ("script", "style", "nav", "header", "footer"):
+        return
+
+    is_bold_tag  = tag in ("strong", "b")
+    is_block_tag = tag in ("p", "div", "br", "li", "tr",
+                           "h1", "h2", "h3", "h4", "h5", "h6",
+                           "blockquote", "pre")
+
+    # Bold tags: wrap content in <b>...</b> with surrounding blank lines
+    if is_bold_tag:
+        # Ensure blank line before bold block (if there's preceding content)
+        if parts and parts[-1] not in ("\n\n", "\n"):
+            parts.append("\n\n")
+        parts.append("<b>")
+        for child in node.children:
+            _walk(child, parts, in_bold=True)
+        parts.append("</b>")
+        parts.append("\n\n")
+        return
+
+    # Block tags: add newline before and after
+    if is_block_tag:
+        if tag != "br" and parts and not parts[-1].endswith("\n"):
+            parts.append("\n")
+        for child in node.children:
+            _walk(child, parts, in_bold=in_bold)
+        if tag == "br":
+            parts.append("\n")
+        elif not parts[-1].endswith("\n"):
+            parts.append("\n")
+        return
+
+    # Inline and other tags: just recurse
+    for child in node.children:
+        _walk(child, parts, in_bold=in_bold)
 
 
 # ---------------------------------------------------------------------------
@@ -310,32 +392,38 @@ def send_judgment(judgment: dict, annotation: str, pending: bool = False) -> boo
     Send a judgment notification, splitting long annotations across multiple
     messages so that the full text is always delivered.
     Returns True if the first (header) message was sent successfully.
-    """
-    # --- Build header ---
-    if judgment.get("full_number"):
-        j_url   = JUDGMENT_URL.format(full_number=judgment["full_number"])
-        j_link  = f'\n🔗 <a href="{j_url}">Lahend / Judgment text</a>'
-        num_str = f"\n📁 <b>Lahendi number:</b> {_esc(judgment['full_number'])}"
-    else:
-        j_link  = f'\n🔗 <a href="{judgment["rss_url"]}">Lahend / Judgment text</a>'
-        num_str = ""
 
+    Format:
+        ⚖️ Uus kriminaalkolleegiumi lahend
+        📅 22.02.2026
+        📋 <1-24-5284/43 linked to judgment text>
+        🔎 <Annotatsioon linked to rikos.rik.ee>
+    """
+    # Judgment number linked to the judgment text (or plain RSS link as fallback)
+    if judgment.get("full_number"):
+        j_url    = JUDGMENT_URL.format(full_number=judgment["full_number"])
+        num_line = f'\n📋 <a href="{j_url}"><b>{_esc(judgment["full_number"])}</b></a>'
+    else:
+        num_line = f'\n📋 <a href="{judgment["rss_url"]}"><b>{_esc(judgment["title"])}</b></a>'
+
+    # Annotation link
     ann_link = ""
     if judgment.get("case_number"):
         a_url    = ANNOTATION_URL.format(case_number=judgment["case_number"])
-        ann_link = f'\n🔎 <a href="{a_url}">Annotatsioon / Full annotation</a>'
+        ann_link = f'\n🔎 <a href="{a_url}">Annotatsioon</a>'
 
-    date_str     = f" · {judgment['date']}" if judgment.get("date") else ""
+    # Date on its own line
+    date_str = f"\n📅 {judgment['date']}" if judgment.get("date") else ""
+
     pending_note = (
-        "\n<i>(annotatsioon lisati hiljem / annotation added later)</i>"
+        "\n<i>(annotatsioon lisati hiljem)</i>"
         if pending else ""
     )
 
     header = (
-        f"⚖️ <b>Uus kriminaalkolleegiumi lahend</b>{date_str}\n"
-        f"\n📋 <b>{_esc(judgment['title'])}</b>"
-        f"{num_str}"
-        f"{j_link}"
+        f"⚖️ <b>Uus kriminaalkolleegiumi lahend</b>"
+        f"{date_str}"
+        f"{num_line}"
         f"{ann_link}"
         f"{pending_note}"
     )
@@ -351,14 +439,14 @@ def send_judgment(judgment: dict, annotation: str, pending: bool = False) -> boo
     total  = len(chunks)
 
     part_suffix = f"\n\n<i>(1/{total})</i>" if total > 1 else ""
-    first_msg   = header + f"\n\n📝 <b>Annotatsioon:</b>\n{_esc(chunks[0])}" + part_suffix
+    first_msg   = header + f"\n\n📝 <b>Annotatsioonid:</b>\n{chunks[0]}" + part_suffix
 
     if not send_message(first_msg):
         return False
     time.sleep(1)
 
     for i, chunk in enumerate(chunks[1:], start=2):
-        send_message(f"📝 <b>Annotatsioon ({i}/{total}):</b>\n{_esc(chunk)}")
+        send_message(f"📝 <b>Annotatsioonid ({i}/{total}):</b>\n{chunk}")
         time.sleep(1)
 
     return True
@@ -440,7 +528,7 @@ def process_pending(state: dict) -> dict:
             send_message(
                 f"ℹ️ Annotatsioon lahendile {j_link} pole {ANNOTATION_MAX_RETRIES} "
                 f"päeva jooksul ilmunud. Kontrolli käsitsi: "
-                f'<a href="{ANNOTATION_URL.format(case_number=case_number)}">rikos.rik.ee</a>'
+                f'<a href="{ANNOTATION_URL.format(case_number=case_number)}">Annotatsioon</a>'
             )
             to_remove.append(uid)
 
