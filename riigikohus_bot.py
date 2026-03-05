@@ -29,11 +29,11 @@ import json
 import time
 import logging
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -48,9 +48,7 @@ ANNOTATION_MAX_RETRIES = int(os.getenv("ANNOTATION_MAX_RETRIES", "3"))
 
 RSS_URL      = "https://www.riigikohus.ee/kuriteo-ja-vaarteoasjad/rss.xml"
 JUDGMENT_URL = "https://www.riigikohus.ee/et/lahendid?asjaNr={full_number}"
-
-ANNOTATION_URL       = "https://rikos.rik.ee/?asjaNr={case_number}&kuvadaVaartus=Annotatsioonid"
-ANNOTATION_URL_PLAIN = "https://rikos.rik.ee/?asjaNr={case_number}"
+ANNOTATION_URL = "https://rikos.rik.ee/?asjaNr={case_number}&kuvadaVaartus=Annotatsioonid"
 
 HEADERS = {
     "User-Agent": (
@@ -61,13 +59,18 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 30
-CHUNK_SIZE      = 3800   # safe Telegram message size (hard limit 4096)
+
+# Telegram hard limit is 4096 chars per message.
+# HEADER_RESERVE accounts for the header block in the first message.
+HEADER_RESERVE = 300
+CHUNK_SIZE     = 4096 - HEADER_RESERVE   # first chunk budget (~3796)
+CONT_CHUNK     = 4000                    # continuation messages have no header
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stdout,   # GitHub Actions captures stdout for the run log
+    stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
 
@@ -147,7 +150,7 @@ def fetch_rss() -> list:
     return judgments
 
 
-def _tag_text(tag, names):
+def _tag_text(tag, names: list) -> str:
     for name in names:
         child = tag.find(name)
         if child:
@@ -158,9 +161,10 @@ def _tag_text(tag, names):
 def _extract_full_number(text: str) -> str:
     """
     Extract judgment number e.g. 1-22-6710/83 or 1-24-1715.
-    The /NN suffix is not a word character so we cannot use \b after it.
+    The /NN suffix is not a word character so \b cannot follow it;
+    we use a lookahead for common delimiters and end-of-string instead.
     """
-    m = re.search(r"\b(1-\d{2}-\d+/\d+)(?=\s|$|[?&\"'<>])", text)
+    m = re.search(r"\b(1-\d{2}-\d+/\d+)(?=[\s?&\"'<>]|$)", text)
     if m:
         return m.group(1)
     m = re.search(r"\b(1-\d{2}-\d+)\b", text)
@@ -168,7 +172,7 @@ def _extract_full_number(text: str) -> str:
 
 
 def _bare_case_number(full_number: str) -> str:
-    """1-22-6710/83  →  1-22-6710"""
+    """'1-22-6710/83'  →  '1-22-6710'"""
     return full_number.split("/")[0] if full_number else ""
 
 
@@ -204,40 +208,44 @@ def _make_uid(text: str) -> str:
 # Annotation scraping
 # ---------------------------------------------------------------------------
 
+_SUPERSCRIPT_MAP = str.maketrans(
+    "0123456789+-=()",
+    "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾",
+)
+
+
+def _replace_sup_tags(node) -> None:
+    """
+    Replace every <sup> tag in-place with its Unicode superscript equivalent
+    so that get_text() keeps it inline rather than adding newline separators.
+    e.g. <sup>1</sup>  →  '¹'
+    """
+    for sup in node.find_all("sup"):
+        sup.replace_with(NavigableString(sup.get_text().translate(_SUPERSCRIPT_MAP)))
+
+
 def fetch_annotation(case_number: str) -> str:
     """
     Scrape the annotation from rikos.rik.ee for the given case number.
-    Returns the full text, or '' if not yet available.
+    Returns Telegram-safe HTML, or '' if not yet available.
     """
     if not case_number:
         return ""
 
-    log.info("Fetching annotation for %s", case_number)
     url = ANNOTATION_URL.format(case_number=case_number)
+    log.info("Fetching annotation for %s", case_number)
 
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        annotation = _parse_annotation(BeautifulSoup(resp.text, "html.parser"))
     except requests.RequestException as exc:
         log.warning("Annotation fetch failed for %s: %s", case_number, exc)
         return ""
 
-    # Fallback: try the plain case URL
-    if not annotation:
-        log.info("Annotation tab empty; trying plain URL for %s", case_number)
-        try:
-            resp2 = requests.get(
-                ANNOTATION_URL_PLAIN.format(case_number=case_number),
-                headers=HEADERS, timeout=REQUEST_TIMEOUT,
-            )
-            resp2.raise_for_status()
-            annotation = _parse_annotation(BeautifulSoup(resp2.text, "html.parser"))
-        except requests.RequestException as exc2:
-            log.warning("Plain annotation URL also failed for %s: %s", case_number, exc2)
+    annotation = _parse_annotation(BeautifulSoup(resp.text, "html.parser"))
 
     if annotation:
-        log.info("Annotation: %d characters.", len(annotation))
+        log.info("Annotation fetched: %d characters.", len(annotation))
     else:
         log.info("No annotation content found for %s.", case_number)
 
@@ -250,7 +258,7 @@ def _parse_annotation(soup: BeautifulSoup) -> str:
 
       <div class="lahendi-otsing-annotatsioonid">
         <div class="annotatsioon">
-          <strong class="annotatsiooni-marksona">Bold keywords...</strong>
+          <strong class="annotatsiooni-marksona">Bold keywords...<br>...</strong>
           <div class="annotatsioon-sisu">Body text...</div>
         </div>
         <hr class="annotatsioon-eraldaja">
@@ -258,11 +266,13 @@ def _parse_annotation(soup: BeautifulSoup) -> str:
         ...
       </div>
 
-    Each annotation is rendered as:
-        <b>keywords</b>
+    Each annotation block is rendered as:
+        <b>keyword line 1
+        keyword line 2</b>
+
         body text
 
-    Multiple annotations are separated by a blank line.
+    Multiple annotation blocks are separated by a blank line.
     Returns Telegram-safe HTML, or '' if no annotations found.
     """
     container = soup.find("div", class_="lahendi-otsing-annotatsioonid")
@@ -275,29 +285,32 @@ def _parse_annotation(soup: BeautifulSoup) -> str:
 
     parts = []
     for ann in annotation_divs:
+
         # --- Bold keywords block ---
         marksona = ann.find("strong", class_="annotatsiooni-marksona")
         if marksona:
-            # Each keyword line is separated by <br> — join with newlines
+            _replace_sup_tags(marksona)
             lines = []
-            for item in marksona.children:
-                from bs4 import NavigableString
-                if isinstance(item, NavigableString):
-                    text = item.strip()
+            for child in marksona.children:
+                if isinstance(child, NavigableString):
+                    text = child.strip()
                     if text:
                         lines.append(_esc(text))
-                elif item.name == "br":
-                    pass  # newlines handled by joining
-            # Fallback: just get all text if the above yields nothing
+                # <br> acts as a line separator — already handled by joining
+            # Fallback if the NavigableString walk yielded nothing
             if not lines:
-                raw = marksona.get_text(separator="\n", strip=True)
-                lines = [_esc(l) for l in raw.splitlines() if l.strip()]
+                lines = [
+                    _esc(l)
+                    for l in marksona.get_text(separator="\n", strip=True).splitlines()
+                    if l.strip()
+                ]
             if lines:
                 parts.append("<b>" + "\n".join(lines) + "</b>")
 
         # --- Body text ---
         sisu = ann.find("div", class_="annotatsioon-sisu")
         if sisu:
+            _replace_sup_tags(sisu)
             body = sisu.get_text(separator="\n", strip=True)
             body = re.sub(r"\n{3,}", "\n\n", body).strip()
             if body:
@@ -306,7 +319,6 @@ def _parse_annotation(soup: BeautifulSoup) -> str:
     if not parts:
         return ""
 
-    # Join annotation blocks with a blank line between them
     return "\n\n".join(parts)
 
 
@@ -341,36 +353,29 @@ def send_message(text: str) -> bool:
 
 def send_judgment(judgment: dict, annotation: str, pending: bool = False) -> bool:
     """
-    Send a judgment notification, splitting long annotations across multiple
-    messages so that the full text is always delivered.
-    Returns True if the first (header) message was sent successfully.
+    Send one or more Telegram messages for a judgment.
 
-    Format:
-        ⚖️ Uus kriminaalkolleegiumi lahend
-        📅 22.02.2026
-        📋 <1-24-5284/43 linked to judgment text>
-        🔎 <Annotatsioon linked to rikos.rik.ee>
+    Message 1:  header + first annotation chunk
+    Message 2…N: continuation chunks (if annotation is long)
+
+    Returns True if the header message was delivered successfully.
+    Continuation failures are logged but do not affect the return value —
+    the judgment is still considered notified (the link is in message 1).
     """
-    # Judgment number linked to the judgment text (or plain RSS link as fallback)
+    # --- Header ---
     if judgment.get("full_number"):
         j_url    = JUDGMENT_URL.format(full_number=judgment["full_number"])
         num_line = f'\n📋 <a href="{j_url}"><b>{_esc(judgment["full_number"])}</b></a>'
     else:
         num_line = f'\n📋 <a href="{judgment["rss_url"]}"><b>{_esc(judgment["title"])}</b></a>'
 
-    # Annotation link
     ann_link = ""
     if judgment.get("case_number"):
         a_url    = ANNOTATION_URL.format(case_number=judgment["case_number"])
         ann_link = f'\n🔎 <a href="{a_url}">Annotatsioon</a>'
 
-    # Date on its own line
-    date_str = f"\n📅 {judgment['date']}" if judgment.get("date") else ""
-
-    pending_note = (
-        "\n<i>(annotatsioon lisati hiljem)</i>"
-        if pending else ""
-    )
+    date_str     = f"\n📅 {judgment['date']}" if judgment.get("date") else ""
+    pending_note = "\n<i>(annotatsioon lisati hiljem)</i>" if pending else ""
 
     header = (
         f"⚖️ <b>Uus kriminaalkolleegiumi lahend</b>"
@@ -386,8 +391,9 @@ def send_judgment(judgment: dict, annotation: str, pending: bool = False) -> boo
         time.sleep(1)
         return ok
 
-    # --- Split annotation into chunks and send ---
-    chunks = _split(annotation, CHUNK_SIZE)
+    # --- Split annotation and send ---
+    # First chunk has less budget because it shares a message with the header.
+    chunks = _split(annotation, first_max=CHUNK_SIZE, rest_max=CONT_CHUNK)
     total  = len(chunks)
 
     part_suffix = f"\n\n<i>(1/{total})</i>" if total > 1 else ""
@@ -398,24 +404,31 @@ def send_judgment(judgment: dict, annotation: str, pending: bool = False) -> boo
     time.sleep(1)
 
     for i, chunk in enumerate(chunks[1:], start=2):
-        send_message(f"📝 <b>Annotatsioonid ({i}/{total}):</b>\n{chunk}")
+        if not send_message(f"📝 <b>Annotatsioonid ({i}/{total}):</b>\n{chunk}"):
+            log.warning("Failed to send annotation part %d/%d — continuing.", i, total)
         time.sleep(1)
 
     return True
 
 
-def _split(text: str, max_chars: int) -> list:
+def _split(text: str, first_max: int, rest_max: int) -> list:
     """
-    Split text into chunks of at most max_chars, preferring paragraph then
-    line then word breaks.  Never cuts inside a <b>...</b> tag.
+    Split text into chunks. The first chunk is limited to first_max chars
+    (to leave room for the header), subsequent chunks to rest_max chars.
+    Prefers splitting at paragraph then line then word boundaries.
+    Never cuts inside a <b>...</b> tag.
     """
-    if len(text) <= max_chars:
+    if len(text) <= first_max:
         return [text]
+
     chunks = []
+    max_chars = first_max
+
     while text:
         if len(text) <= max_chars:
             chunks.append(text)
             break
+
         cut = text.rfind("\n\n", 0, max_chars)
         if cut == -1:
             cut = text.rfind("\n", 0, max_chars)
@@ -423,20 +436,25 @@ def _split(text: str, max_chars: int) -> list:
             cut = text.rfind(" ", 0, max_chars)
         if cut == -1:
             cut = max_chars
+
         candidate = text[:cut].strip()
-        # If we'd leave an unclosed <b>, back up to before the opening tag
+
+        # Don't split inside an unclosed <b> tag
         if candidate.count("<b>") > candidate.count("</b>"):
             safe = candidate.rfind("<b>")
             if safe > 0:
-                cut = safe
-                candidate = text[:cut].strip()
+                candidate = text[:safe].strip()
+
         chunks.append(candidate)
-        text = text[cut:].strip()
+        text = text[len(candidate):].strip()
+        max_chars = rest_max  # subsequent chunks use the larger budget
+
     return [c for c in chunks if c]
 
 
 def _esc(text: str) -> str:
-    return str(text).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    """Escape plain text for use in Telegram HTML messages."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------------------
@@ -446,10 +464,11 @@ def _esc(text: str) -> str:
 def process_pending(state: dict) -> dict:
     """
     Work through judgments that previously had no annotation.
-    On each daily run we try once more per pending entry.
-    - Found       → send a follow-up message, remove from pending.
-    - Not found, retries remain  → increment counter, keep in pending.
-    - Not found, retries exhausted → send a "still unavailable" notice, remove.
+    Called once per daily run before checking for new judgments.
+
+    - Annotation found        → send follow-up message, remove from pending.
+    - Still missing, retries remain   → increment counter, keep in pending.
+    - Still missing, retries exhausted → send a notice, remove from pending.
     """
     pending = state.get("pending", {})
     if not pending:
@@ -487,10 +506,10 @@ def process_pending(state: dict) -> dict:
                 j_link = f'<a href="{j_url}">{_esc(judgment["full_number"])}</a>'
             else:
                 j_link = _esc(judgment.get("title", "?"))
+            a_url = ANNOTATION_URL.format(case_number=case_number)
             send_message(
                 f"ℹ️ Annotatsioon lahendile {j_link} pole {ANNOTATION_MAX_RETRIES} "
-                f"päeva jooksul ilmunud. Kontrolli käsitsi: "
-                f'<a href="{ANNOTATION_URL.format(case_number=case_number)}">Annotatsioon</a>'
+                f'päeva jooksul ilmunud. <a href="{a_url}">Kontrolli käsitsi.</a>'
             )
             to_remove.append(uid)
 
@@ -524,7 +543,7 @@ def main() -> None:
     # 1. Retry any pending annotations first
     state = process_pending(state)
 
-    # 2. Fetch the RSS feed and find new judgments
+    # 2. Fetch RSS and find new judgments
     seen      = set(state.get("seen", []))
     judgments = fetch_rss()
     new       = [j for j in judgments if j["uid"] not in seen]
@@ -546,7 +565,6 @@ def main() -> None:
 
         if send_judgment(judgment, annotation):
             seen.add(judgment["uid"])
-            # Queue for annotation retry if none was available yet
             if not annotation and judgment.get("case_number"):
                 state.setdefault("pending", {})[judgment["uid"]] = {
                     "judgment":     judgment,
