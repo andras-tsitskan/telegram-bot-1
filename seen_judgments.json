@@ -1,0 +1,42 @@
+{
+  "seen": [
+    "1eba8456350d89e1c73e",
+    "21691fd3d73b18339d0a",
+    "2ce63015487d1a215673",
+    "329b970290dd15b11797",
+    "3c8d8d524e6a5952115d",
+    "4063ea4eebb8bfef7c68",
+    "48088b5195b16e36eab9",
+    "55f2130e2e30df9cc754",
+    "56b9c0459c116cd08911",
+    "5c1a998d44360f3ab478",
+    "646b3bd57d0de9b77d74",
+    "651a32884090f9e049cf",
+    "723644728cb60f0de731",
+    "7724c99dbba5fcff83ea",
+    "8b810500b894af9fe129",
+    "9ffe3cdc4ac7a07128d0",
+    "a168c954d60c1332229d",
+    "abd40f7febb1e7f9e243",
+    "b4c7f0ff80626d22d612",
+    "d579c1ab2b284e0ded49",
+    "e7fb0a6031c537d34092",
+    "ebb96f4b3a0d0b1ec9f0",
+    "ecab1b916f227718b2ea",
+    "fca011e24e85266425cd"
+  ],
+  "pending": {
+    "5c1a998d44360f3ab478": {
+      "judgment": {
+        "title": "1-25-1753",
+        "rss_url": "https://www.riigikohus.ee/et/lahendid/?asjaNr=1-25-1753",
+        "full_number": "1-25-1753",
+        "case_number": "1-25-1753",
+        "date": "20.11.2025",
+        "uid": "5c1a998d44360f3ab478"
+      },
+      "retries_done": 0
+    }
+  },
+  "updated": "2026-03-05T19:49:00.271296"
+}
