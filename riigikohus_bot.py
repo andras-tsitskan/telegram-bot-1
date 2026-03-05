@@ -118,7 +118,7 @@ def fetch_rss() -> list:
         log.error("Failed to fetch RSS feed: %s", exc)
         return []
 
-    soup  = BeautifulSoup(resp.content, "xml")
+    soup  = BeautifulSoup(resp.content, "lxml-xml")
     items = soup.find_all("item") or soup.find_all("entry")
 
     judgments = []
