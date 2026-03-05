@@ -1,5 +1,9 @@
 {
   "seen": [
+    "1eba8456350d89e1c73e",
+    "21691fd3d73b18339d0a",
+    "2ce63015487d1a215673",
+    "329b970290dd15b11797",
     "3c8d8d524e6a5952115d",
     "4063ea4eebb8bfef7c68",
     "48088b5195b16e36eab9",
@@ -31,8 +35,30 @@
         "date": "20.11.2025",
         "uid": "5c1a998d44360f3ab478"
       },
-      "retries_done": 1
+      "retries_done": 2
+    },
+    "329b970290dd15b11797": {
+      "judgment": {
+        "title": "1-22-2637",
+        "rss_url": "https://www.riigikohus.ee/et/lahendid/?asjaNr=1-22-2637",
+        "full_number": "1-22-2637",
+        "case_number": "1-22-2637",
+        "date": "04.12.2025",
+        "uid": "329b970290dd15b11797"
+      },
+      "retries_done": 0
+    },
+    "1eba8456350d89e1c73e": {
+      "judgment": {
+        "title": "1-23-6929",
+        "rss_url": "https://www.riigikohus.ee/et/lahendid/?asjaNr=1-23-6929",
+        "full_number": "1-23-6929",
+        "case_number": "1-23-6929",
+        "date": "28.10.2025",
+        "uid": "1eba8456350d89e1c73e"
+      },
+      "retries_done": 0
     }
   },
-  "updated": "2026-03-05T20:25:13.082003"
+  "updated": "2026-03-05T20:26:52.387384"
 }
