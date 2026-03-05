@@ -244,118 +244,70 @@ def fetch_annotation(case_number: str) -> str:
     return annotation
 
 
-# Keyword that must appear in the scraped text for it to be accepted as a
-# real annotation.  rikos.rik.ee annotations always contain this Estonian
-# word.  If the scraped block doesn't contain it we treat the result as
-# boilerplate / navigation noise and return nothing.
-_ANNOTATION_MARKER = re.compile(r"annotat", re.I)
-
-
 def _parse_annotation(soup: BeautifulSoup) -> str:
     """
-    Extract annotation body from a rikos.rik.ee page, preserving bold
-    formatting as Telegram HTML <b> tags with blank lines around them.
+    Extract annotations from a rikos.rik.ee page using the known HTML structure:
 
-    Returns a string of Telegram-safe HTML, or '' if no annotation found.
+      <div class="lahendi-otsing-annotatsioonid">
+        <div class="annotatsioon">
+          <strong class="annotatsiooni-marksona">Bold keywords...</strong>
+          <div class="annotatsioon-sisu">Body text...</div>
+        </div>
+        <hr class="annotatsioon-eraldaja">
+        <div class="annotatsioon">...</div>
+        ...
+      </div>
+
+    Each annotation is rendered as:
+        <b>keywords</b>
+        body text
+
+    Multiple annotations are separated by a blank line.
+    Returns Telegram-safe HTML, or '' if no annotations found.
     """
-    selectors = [
-        lambda s: s.find("div", class_=re.compile(r"annotat", re.I)),
-        lambda s: s.find("div", id=re.compile(r"annotat", re.I)),
-        lambda s: s.find("div", class_=re.compile(r"field.*body|body.*field", re.I)),
-        lambda s: s.find("div", class_=re.compile(r"node.*content|content.*node", re.I)),
-        lambda s: s.find("div", class_="content"),
-        lambda s: s.find("main"),
-        lambda s: s.find("article"),
-        lambda s: s.find("div", id="content"),
-        lambda s: s.find("div", role="main"),
-    ]
-    for sel in selectors:
-        node = sel(soup)
-        if not node:
-            continue
-        for tag in node.find_all(["script", "style", "nav", "header", "footer"]):
-            tag.decompose()
-        # Quick plain-text check first — must be substantial and annotation-like
-        plain = node.get_text(separator=" ", strip=True)
-        if len(plain) > 200 and _ANNOTATION_MARKER.search(plain):
-            return _node_to_telegram_html(node)
+    container = soup.find("div", class_="lahendi-otsing-annotatsioonid")
+    if not container:
+        return ""
 
-    return ""
+    annotation_divs = container.find_all("div", class_="annotatsioon")
+    if not annotation_divs:
+        return ""
 
-
-def _node_to_telegram_html(node) -> str:
-    """
-    Walk a BeautifulSoup node and convert it to Telegram-safe HTML.
-
-    Rules:
-    - <strong> and <b> content → <b>...</b> in output
-    - Block elements (p, div, br, li, h1-h6) → newlines
-    - Bold blocks get a blank line before and after them
-    - All plain text is HTML-escaped
-    - Consecutive blank lines are collapsed to one
-    """
     parts = []
-    _walk(node, parts, in_bold=False)
-    text = "".join(parts)
-    # Collapse runs of 3+ newlines to 2
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    for ann in annotation_divs:
+        # --- Bold keywords block ---
+        marksona = ann.find("strong", class_="annotatsiooni-marksona")
+        if marksona:
+            # Each keyword line is separated by <br> — join with newlines
+            lines = []
+            for item in marksona.children:
+                from bs4 import NavigableString
+                if isinstance(item, NavigableString):
+                    text = item.strip()
+                    if text:
+                        lines.append(_esc(text))
+                elif item.name == "br":
+                    pass  # newlines handled by joining
+            # Fallback: just get all text if the above yields nothing
+            if not lines:
+                raw = marksona.get_text(separator="\n", strip=True)
+                lines = [_esc(l) for l in raw.splitlines() if l.strip()]
+            if lines:
+                parts.append("<b>" + "\n".join(lines) + "</b>")
 
+        # --- Body text ---
+        sisu = ann.find("div", class_="annotatsioon-sisu")
+        if sisu:
+            body = sisu.get_text(separator="\n", strip=True)
+            body = re.sub(r"\n{3,}", "\n\n", body).strip()
+            if body:
+                parts.append(_esc(body))
 
-def _walk(node, parts: list, in_bold: bool) -> None:
-    """Recursively walk the BeautifulSoup tree, appending to parts."""
-    from bs4 import NavigableString, Tag
+    if not parts:
+        return ""
 
-    if isinstance(node, NavigableString):
-        content = str(node)
-        if content.strip():
-            parts.append(_esc(content) if not in_bold else _esc(content))
-        elif content and parts and not parts[-1].endswith("\n"):
-            # Preserve a single space for inline whitespace
-            parts.append(" ")
-        return
-
-    if not isinstance(node, Tag):
-        return
-
-    tag = node.name.lower() if node.name else ""
-
-    # Tags to skip entirely
-    if tag in ("script", "style", "nav", "header", "footer"):
-        return
-
-    is_bold_tag  = tag in ("strong", "b")
-    is_block_tag = tag in ("p", "div", "br", "li", "tr",
-                           "h1", "h2", "h3", "h4", "h5", "h6",
-                           "blockquote", "pre")
-
-    # Bold tags: wrap content in <b>...</b> with surrounding blank lines
-    if is_bold_tag:
-        # Ensure blank line before bold block (if there's preceding content)
-        if parts and parts[-1] not in ("\n\n", "\n"):
-            parts.append("\n\n")
-        parts.append("<b>")
-        for child in node.children:
-            _walk(child, parts, in_bold=True)
-        parts.append("</b>")
-        parts.append("\n\n")
-        return
-
-    # Block tags: add newline before and after
-    if is_block_tag:
-        if tag != "br" and parts and not parts[-1].endswith("\n"):
-            parts.append("\n")
-        for child in node.children:
-            _walk(child, parts, in_bold=in_bold)
-        if tag == "br":
-            parts.append("\n")
-        elif not parts[-1].endswith("\n"):
-            parts.append("\n")
-        return
-
-    # Inline and other tags: just recurse
-    for child in node.children:
-        _walk(child, parts, in_bold=in_bold)
+    # Join annotation blocks with a blank line between them
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +405,10 @@ def send_judgment(judgment: dict, annotation: str, pending: bool = False) -> boo
 
 
 def _split(text: str, max_chars: int) -> list:
-    """Split text into chunks, preferring paragraph then line then word breaks."""
+    """
+    Split text into chunks of at most max_chars, preferring paragraph then
+    line then word breaks.  Never cuts inside a <b>...</b> tag.
+    """
     if len(text) <= max_chars:
         return [text]
     chunks = []
@@ -468,7 +423,14 @@ def _split(text: str, max_chars: int) -> list:
             cut = text.rfind(" ", 0, max_chars)
         if cut == -1:
             cut = max_chars
-        chunks.append(text[:cut].strip())
+        candidate = text[:cut].strip()
+        # If we'd leave an unclosed <b>, back up to before the opening tag
+        if candidate.count("<b>") > candidate.count("</b>"):
+            safe = candidate.rfind("<b>")
+            if safe > 0:
+                cut = safe
+                candidate = text[:cut].strip()
+        chunks.append(candidate)
         text = text[cut:].strip()
     return [c for c in chunks if c]
 
