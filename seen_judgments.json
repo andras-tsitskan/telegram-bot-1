@@ -1,5 +1,6 @@
 {
   "seen": [
+    "13849e011bece85accd1",
     "1eba8456350d89e1c73e",
     "21691fd3d73b18339d0a",
     "2ce63015487d1a215673",
@@ -25,6 +26,18 @@
     "ecab1b916f227718b2ea",
     "fca011e24e85266425cd"
   ],
-  "pending": {},
-  "updated": "2026-03-05T20:31:29.145707"
+  "pending": {
+    "13849e011bece85accd1": {
+      "judgment": {
+        "title": "1-24-2367",
+        "rss_url": "https://www.riigikohus.ee/et/lahendid/?asjaNr=1-24-2367",
+        "full_number": "1-24-2367",
+        "case_number": "1-24-2367",
+        "date": "05.03.2026",
+        "uid": "13849e011bece85accd1"
+      },
+      "retries_done": 0
+    }
+  },
+  "updated": "2026-03-06T07:40:44.860858"
 }
