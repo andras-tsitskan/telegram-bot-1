@@ -26,18 +26,6 @@
     "ecab1b916f227718b2ea",
     "fca011e24e85266425cd"
   ],
-  "pending": {
-    "13849e011bece85accd1": {
-      "judgment": {
-        "title": "1-24-2367",
-        "rss_url": "https://www.riigikohus.ee/et/lahendid/?asjaNr=1-24-2367",
-        "full_number": "1-24-2367",
-        "case_number": "1-24-2367",
-        "date": "05.03.2026",
-        "uid": "13849e011bece85accd1"
-      },
-      "retries_done": 2
-    }
-  },
-  "updated": "2026-03-08T07:33:39.128975"
+  "pending": {},
+  "updated": "2026-03-09T07:51:29.389272"
 }
